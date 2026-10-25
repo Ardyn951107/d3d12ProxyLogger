@@ -1,4 +1,4 @@
-# d3d12 proxy + logger (Pragmata build, TestStep 11)
+# d3d12 proxy + logger (Pragmata build)
 
 Logging build of the `d3d12ProxyEdrDx11_0` wrapper, made to find out why Pragmata and
 other Capcom (RE Engine) DX12 games now crash with it. It still does what the original did:
