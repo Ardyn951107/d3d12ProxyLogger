@@ -1,0 +1,12 @@
+# compiled output (source-only repo)
+bin/*.dll
+*.obj
+*.o
+*.exp
+*.lib
+*.pdb
+
+# runtime output from the proxy
+d3d12proxy_logs/
+*.dmp
+*.log

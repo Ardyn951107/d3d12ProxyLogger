@@ -1,0 +1,54 @@
+// vtable slot numbers used for hooking. vtbl_check.c verifies every value
+// against the official DirectX-Headers C vtables at build time.
+#pragma once
+#define IDX_Device_CreateCommandQueue            8
+#define IDX_Device_CreateCommandAllocator        9
+#define IDX_Device_CreateGraphicsPipelineState  10
+#define IDX_Device_CreateComputePipelineState   11
+#define IDX_Device_CreateCommandList            12
+#define IDX_Device_CheckFeatureSupport          13
+#define IDX_Device_CreateDescriptorHeap         14
+#define IDX_Device_CreateRootSignature          16
+#define IDX_Device_CreateCommittedResource      27
+#define IDX_Device_CreateHeap                   28
+#define IDX_Device_CreatePlacedResource         29
+#define IDX_Device_CreateReservedResource       30
+#define IDX_Device_CreateFence                  36
+#define IDX_Device_GetDeviceRemovedReason       37
+#define IDX_Device_CreateQueryHeap              39
+#define IDX_Device_CreateCommandSignature       41
+#define IDX_Device2_CreatePipelineState         47
+#define IDX_Device4_CreateCommittedResource1    53
+#define IDX_Device4_CreateHeap1                 54
+#define IDX_Device5_CreateStateObject           62
+#define IDX_Device8_CreateCommittedResource2    69
+#define IDX_Device8_CreatePlacedResource1       70
+#define IDX_Device10_CreateCommittedResource3   76
+#define IDX_Device10_CreatePlacedResource2      77
+#define IDX_DeviceFactory_CreateDevice           9
+#define IDX_SDKConfiguration_SetSDKVersion       3
+#define IDX_SDKConfiguration1_CreateDeviceFactory 4
+#define IDX_Queue_UpdateTileMappings             8
+#define IDX_Queue_CopyTileMappings               9
+#define IDX_Queue_ExecuteCommandLists           10
+#define IDX_Queue_Signal                        14
+#define IDX_Queue_Wait                          15
+#define IDX_Device5_RemoveDevice                58
+#define IDX_Device9_CreateCommandQueue1         75
+#define IDX_Queue_GetDesc                       18
+
+#define IDX_List_Close                          9
+#define IDX_List_Reset                          10
+#define IDX_List_DrawInstanced                  12
+#define IDX_List_DrawIndexedInstanced           13
+#define IDX_List_Dispatch                       14
+#define IDX_List_SetPipelineState               25
+#define IDX_List_ExecuteIndirect                59
+#define IDX_Device4_CreateCommandList1          51
+#define IDX_Device_CreateRenderTargetView       20
+#define IDX_Device_CreateDepthStencilView       21
+#define IDX_Device_CopyDescriptors              23
+#define IDX_Device_CopyDescriptorsSimple        24
+#define IDX_List_OMSetRenderTargets             46
+#define IDX_List_ClearDepthStencilView          47
+#define IDX_List_ClearRenderTargetView          48
