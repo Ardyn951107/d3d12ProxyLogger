@@ -54,7 +54,7 @@
 #include <limits.h>
 #include "names_gen.h"
 
-#define PROXY_VERSION "1.5.0-logger"
+#define PROXY_VERSION "1.9.0-logger"
 
 // ------------------------------------------------------------------ vtable indices
 // Verified against the DirectX-Headers C vtables by vtbl_check.c at build time.
@@ -99,6 +99,10 @@ struct Config {
     int  reservedAsCommitted      = 0;
     int  oomRetries               = 0;
     int  oomSysMem                = 0;
+    int  allocStats               = 0;
+    int  residencyPrio            = 0;
+    int  nullSkip                 = -1;   // -1 = auto (on for Onimusha), 0 off, 1 on
+    int  bigBufWaitMs             = 0;
     int  skipDispatches           = 0;
     wchar_t skipShaders[256]      = L"";
     int  agilityOverride          = 0;
@@ -484,6 +488,10 @@ static void LoadConfig() {
     g_cfg.reservedAsCommitted   = (int)GetPrivateProfileIntW(L"Patches", L"ReservedAsCommitted", g_cfg.reservedAsCommitted, g_iniPath);
     g_cfg.oomRetries            = (int)GetPrivateProfileIntW(L"Patches", L"OomRetries", g_cfg.oomRetries, g_iniPath);
     g_cfg.oomSysMem             = (int)GetPrivateProfileIntW(L"Patches", L"OomSysMem", g_cfg.oomSysMem, g_iniPath);
+    g_cfg.allocStats            = (int)GetPrivateProfileIntW(L"Patches", L"AllocStats", g_cfg.allocStats, g_iniPath);
+    g_cfg.residencyPrio         = (int)GetPrivateProfileIntW(L"Patches", L"ResidencyPriority", g_cfg.residencyPrio, g_iniPath);
+    g_cfg.bigBufWaitMs          = (int)GetPrivateProfileIntW(L"Patches", L"BigBufWaitMs", g_cfg.bigBufWaitMs, g_iniPath);
+    g_cfg.nullSkip              = (int)GetPrivateProfileIntW(L"Patches", L"NullSkip", g_cfg.nullSkip, g_iniPath);
     GetPrivateProfileStringW(L"Patches", L"SkipShaders", L"", g_cfg.skipShaders, 256, g_iniPath);
     g_cfg.agilityOverride       = (int)GetPrivateProfileIntW(L"Agility", L"SDKVersion", 0, g_iniPath);
     GetPrivateProfileStringW(L"Agility", L"SDKPath", L".\\D3D12_619\\", g_cfg.agilityPath, MAX_PATH, g_iniPath);
@@ -501,7 +509,7 @@ static void LoadConfig() {
     case 7: g_cfg.patchRemapFallback = 1; g_cfg.forceRelocList = 1; g_cfg.forceRelocation = 1; g_cfg.tileBacking = 1; g_cfg.agilityOverride = 0; g_cfg.debugLayer = 0; break;
     case 9: g_cfg.patchRemapFallback = 1; g_cfg.forceRelocList = 1; g_cfg.forceRelocation = 1; g_cfg.tileBacking = 1; g_cfg.syncSubmits = 1; g_cfg.agilityOverride = 0; g_cfg.debugLayer = 0; break;
     case 10: g_cfg.patchRemapFallback = 1; g_cfg.forceRelocList = 1; g_cfg.forceRelocation = 1; g_cfg.tileBacking = 1; g_cfg.syncSubmits = 1; g_cfg.recordLists = 1; g_cfg.agilityOverride = 0; g_cfg.debugLayer = 0; break;
-    case 11: g_cfg.patchRemapFallback = 1; g_cfg.forceRelocList = 1; g_cfg.forceRelocation = 1; g_cfg.reservedAsCommitted = 1; g_cfg.oomRetries = 20; g_cfg.oomSysMem = 1; g_cfg.recordLists = 1; g_cfg.agilityOverride = 0; g_cfg.debugLayer = 0; break;
+    case 11: g_cfg.patchRemapFallback = 1; g_cfg.forceRelocList = 1; g_cfg.forceRelocation = 1; g_cfg.reservedAsCommitted = 1; g_cfg.oomRetries = 20; g_cfg.oomSysMem = 1; g_cfg.allocStats = 1; g_cfg.residencyPrio = 1; g_cfg.bigBufWaitMs = 2000; g_cfg.recordLists = 1; g_cfg.agilityOverride = 0; g_cfg.debugLayer = 0; break;
     case 8: g_cfg.patchRemapFallback = 1; g_cfg.forceRelocList = 0; g_cfg.forceRelocation = 0; g_cfg.tileBacking = 1; g_cfg.agilityOverride = 0; g_cfg.debugLayer = 0; break;
     }
 
@@ -873,7 +881,7 @@ static void PixAttach() {
 }
 
 // ---- resource registry: pointer -> how/where it was created (for crash reports)
-struct ResRec { void* volatile key; const char* fn; DWORD tid; float t; UINT64 width; UINT height; UINT16 depth, mips; int fmt, dim, heapType, layout; UINT flags, heapFlags; };
+struct ResRec { void* volatile key; const char* fn; DWORD tid; float t; UINT64 width; UINT height; UINT16 depth, mips; int fmt, dim, heapType, layout; UINT flags, heapFlags; UINT64 bytes; volatile LONG live; int cat; void* twin; };
 #define RES_SLOTS (1 << 17)
 static ResRec* g_res;            // allocated on first use
 static volatile LONG g_resCount;
@@ -1181,6 +1189,16 @@ static void CrashReport(const char* kind, EXCEPTION_POINTERS* ep, bool full, boo
 // address of "mov rax,[r10+18]" in RemapTable_Find; a fault there with R10 == 0 means
 // "remapped buffer not in table" -> return the original resource (RDX) to the caller.
 static uint8_t* volatile g_remapFaultSite;
+static volatile LONG g_nullSkipHits;
+static bool NullSkipEnabled() {
+    static int v = -1;
+    if (v < 0) {
+        int on = g_cfg.nullSkip;
+        if (on < 0) { on = 0; for (const wchar_t* p = g_exeName; *p; p++) if (!_wcsnicmp(p, L"onimusha", 8)) { on = 1; break; } }
+        v = on;
+    }
+    return v == 1;
+}
 static volatile LONG g_remapFixups;
 
 // Pragmata 1.1.0.0 layout (only used when the RemapFallback signature matched = same build)
@@ -1266,6 +1284,56 @@ static void RemapProbe(CONTEXT* c) {
 
 static LONG CALLBACK Veh(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // Onimusha (RE Engine, OnimushaWotS.exe 1.0.1.0): a lookup that finds no node computes &node->value as 0+0x18 and loads
+    // "mov rsi,[rdx]" (48 8B 32) with RDX=0x18. RSI still holds the lookup key (the resource), so skipping the load
+    // makes "not found" return the key, same meaning as the Pragmata fixes. Matches any "mov r64,[r64]" (mod 00) that
+    // read-faults at exactly 0x18 with the base register == 0x18, inside the game exe, and only runs in games that opt in.
+    if (code == EXCEPTION_ACCESS_VIOLATION && NullSkipEnabled()) {
+        EXCEPTION_RECORD* er = ep->ExceptionRecord; CONTEXT* c = ep->ContextRecord;
+        if (er->NumberParameters >= 2 && er->ExceptionInformation[0] == 0 && er->ExceptionInformation[1] == 0x18) {
+            HMODULE exe = GetModuleHandleW(nullptr); IMAGE_NT_HEADERS64* nt = NtHeaders(exe);
+            const uint8_t* ip = (const uint8_t*)c->Rip;
+            if (nt && c->Rip - (DWORD64)exe < nt->OptionalHeader.SizeOfImage && Readable(ip, 3) &&
+                (ip[0] & 0xFA) == 0x48 && ip[1] == 0x8B && (ip[2] >> 6) == 0 && (ip[2] & 7) != 4 && (ip[2] & 7) != 5) {
+                int src = (ip[2] & 7) | ((ip[0] & 1) << 3);
+                DWORD64* regs = &c->Rax;               // CONTEXT: Rax,Rcx,Rdx,Rbx,Rsp,Rbp,Rsi,Rdi,R8..R15
+                if (regs[src] == 0x18) {
+                    static void* sites[16]; static volatile LONG nsites;
+                    LONG n = InterlockedIncrement(&g_nullSkipHits); bool isNew = true;
+                    for (LONG i = 0; i < nsites && i < 16; i++) if (sites[i] == (void*)c->Rip) isNew = false;
+                    if (isNew && nsites < 16) {
+                        LONG k = InterlockedIncrement(&nsites) - 1; sites[k] = (void*)c->Rip;
+                        DWORD err = GetLastError(); TlsSet(TLS_IN_VEH, true);
+                        Log("[fix] NullSkip site #%ld at %s: skipped \"mov r%d,[r%d]\" that read 0x18 (dest register keeps the lookup key); hits so far %ld",
+                            k + 1, AddrName((void*)c->Rip), ((ip[2] >> 3) & 7) | ((ip[0] & 4) << 1), src, n);
+                        SnapshotCode(c->Rip, 90 + (int)k);
+                        TlsSet(TLS_IN_VEH, false); SetLastError(err);
+                    } else if ((n & (n - 1)) == 0) {
+                        DWORD err = GetLastError(); TlsSet(TLS_IN_VEH, true);
+                        Log("[fix] NullSkip: %ld hits so far", n); TlsSet(TLS_IN_VEH, false); SetLastError(err);
+                    }
+                    c->Rip += 3;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+    }
+    // Full-release build: RemapTable_Find walks "mov rcx,[rcx+r8*8]; mov rcx,[rcx]; cmp [rcx+10h],rax" and the bucket array is NULL
+    // while the table is empty. Return the key (still in RAX) from the leaf function, same meaning as "table disabled".
+    if (code == EXCEPTION_ACCESS_VIOLATION && g_cfg.patchRemapFallback && !g_remapFaultSite) {
+        static const uint8_t kFind2Fault[] = { 0x4A,0x8B,0x0C,0xC1,0x48,0x8B,0x09,0x48,0x39,0x41,0x10 };
+        void* ip = ep->ExceptionRecord->ExceptionAddress; CONTEXT* c = ep->ContextRecord;
+        if (c->Rcx == 0 && c->Rax && Readable(ip, sizeof kFind2Fault) && !memcmp(ip, kFind2Fault, sizeof kFind2Fault) && Readable((void*)c->Rsp, 8)) {
+            c->Rip = *(DWORD64*)c->Rsp; c->Rsp += 8;
+            LONG n = InterlockedIncrement(&g_remapFixups);
+            if (n <= 3 || (n & (n - 1)) == 0) {
+                DWORD err = GetLastError(); TlsSet(TLS_IN_VEH, true);
+                Log("[fix] RemapFallback(v2) #%ld: remap table empty, key %p used directly (returning to %s)", n, (void*)c->Rax, AddrName((void*)c->Rip));
+                TlsSet(TLS_IN_VEH, false); SetLastError(err);
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (code == EXCEPTION_ACCESS_VIOLATION && g_remapFaultSite && ep->ExceptionRecord->ExceptionAddress == (void*)g_remapFaultSite) {
         CONTEXT* c = ep->ContextRecord;
         if (c->R10 == 0 && Readable((void*)c->Rsp, 8)) {
@@ -1552,8 +1620,75 @@ DECL_HOOK(CreatePlacedResource2, HRESULT, ID3D12Device*, ID3D12Heap*, UINT64, co
 
 static bool FailBudget() { return InterlockedIncrement(&g_failLines) <= 2000; }
 
+// ---- allocation telemetry: what the game allocates, how big, how long it lives, how fast it churns ----
+static bool PatchSlot(void** vt, int idx, void* hook, void** orig);
+struct HeapRec;
+static void* volatile g_heapVtbl;
+static ULONG (STDMETHODCALLTYPE *o_ResRelease)(void*);
+static ULONG (STDMETHODCALLTYPE *o_HeapRelease)(void*);
+static void InstallRelease(void* vt, void* hook, void** orig) { if (g_cfg.allocStats && vt) PatchSlot((void**)vt, 2, hook, orig); }
+static const int NCAT = 15;               // heapType(0 placed/none,1 DEFAULT,2 UPLOAD,3 READBACK,4 CUSTOM) x kind(0 buffer,1 texture,2 RT/DS/UAV texture)
+static volatile LONG64 s_liveB[NCAT], s_liveN[NCAT];
+static volatile LONG64 s_iAllocB, s_iAllocN, s_iFreeB, s_iFreeN;       // per heartbeat interval
+static volatile LONG64 s_tAllocB, s_tFreeB, s_peakLive, s_tLifeMs, s_tLifeN, s_shortN, s_shortB, s_placedN, s_reservedN, s_twinN;
+static volatile LONG64 s_hLiveB[6], s_hLiveN[6], s_hAllocB, s_hFreeB, s_hIAllocB, s_hIFreeB;
+static const GUID IID_Dev1_ = {0x77acce80,0x638e,0x4e65,{0x88,0x95,0xc1,0xf2,0x33,0x86,0x86,0x3e}};
+static const GUID IID_Pageable_ = {0x63ee58fb,0x1268,0x4835,{0x86,0xda,0xf0,0x08,0xce,0x62,0xf0,0xd6}};
+static volatile LONG s_bigLogs; static volatile LONG64 s_prioLow, s_prioHigh, s_throttleN, s_throttleMs, s_throttleTimeouts;
+static const char* KindName(int k) { return k == 0 ? "buffer" : k == 1 ? "texture" : "RT/DS/UAV tex"; }
+static LONG64 LiveTotal() { LONG64 t = 0; for (int i = 0; i < NCAT; i++) t += s_liveB[i]; return t; }
+static void HeapAccount(HeapRec* r, bool add);
+static void AllocAccount(void* p, const char* fn, const D3D12_HEAP_PROPERTIES* hp, const D3D12_RESOURCE_DESC* d) {
+    ResRec* r = ResSlot(p, false); if (!r) return;
+    bool placed = strstr(fn, "Placed") != nullptr, reserved = strstr(fn, "(tiled)") != nullptr;
+    UINT64 bytes = 0; int ht = hp ? (int)hp->Type : 0; if (ht < 0 || ht > 4) ht = 0;
+    int kind = d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 0 : ((d->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) ? 2 : 1);
+    if (placed) { InterlockedIncrement64(&s_placedN); ht = 0; }         // lives inside a heap that is counted separately
+    else if (reserved) { InterlockedIncrement64(&s_reservedN); }       // no memory until tiles are mapped
+    else if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) bytes = d->Width;
+    else if (g_lastDevice) { InternalScope is; D3D12_RESOURCE_ALLOCATION_INFO ai = {}; g_lastDevice->GetResourceAllocationInfo(&ai, 0, 1, d); bytes = ai.SizeInBytes; }
+    int cat = ht * 3 + kind;
+    r->bytes = bytes; r->cat = cat; r->twin = nullptr; InterlockedExchange(&r->live, 1);
+    InterlockedAdd64(&s_liveB[cat], (LONG64)bytes); InterlockedIncrement64(&s_liveN[cat]);
+    InterlockedAdd64(&s_iAllocB, (LONG64)bytes); InterlockedIncrement64(&s_iAllocN); InterlockedAdd64(&s_tAllocB, (LONG64)bytes);
+    LONG64 lt = LiveTotal(); if (lt > s_peakLive) s_peakLive = lt;
+    if (bytes >= (32ull << 20) && InterlockedIncrement(&s_bigLogs) <= 400)
+        Log("[alloc] +%llu MB %s %s %llux%u fmt=%s heap=%s via %s tid=%lu | live total %lld MB", (unsigned long long)(bytes >> 20), KindName(kind), DimName(d->Dimension),
+            (unsigned long long)d->Width, d->Height, FormatName(d->Format), HeapTypeName(ht), fn, (unsigned long)GetCurrentThreadId(), (long long)(lt >> 20));
+    // Residency hints: when VRAM overflows Windows evicts the lowest priority first. Big UAV buffers (GPU pools, touched sparsely) go
+    // low so render targets / depth stay resident; RT/DS textures go high.
+    if (g_cfg.residencyPrio && ht == 1 && !placed && !reserved && g_lastDevice) {
+        D3D12_RESIDENCY_PRIORITY pr = D3D12_RESIDENCY_PRIORITY_NORMAL;
+        if (kind == 0 && bytes >= (16ull << 20)) pr = D3D12_RESIDENCY_PRIORITY_LOW;
+        else if (kind == 2 && !(d->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS && !(d->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))) pr = D3D12_RESIDENCY_PRIORITY_HIGH;
+        if (pr != D3D12_RESIDENCY_PRIORITY_NORMAL) {
+            static ID3D12Device1* dev1; if (!dev1) { ID3D12Device1* x = nullptr; if (SUCCEEDED(g_lastDevice->QueryInterface(IID_Dev1_, (void**)&x))) dev1 = x; }
+            ID3D12Pageable* pg = nullptr;
+            if (dev1 && SUCCEEDED(((IUnknown*)p)->QueryInterface(IID_Pageable_, (void**)&pg)) && pg) {
+                HRESULT hr = dev1->SetResidencyPriority(1, &pg, &pr); pg->Release();
+                static volatile LONG n; if (InterlockedIncrement(&n) <= 6) Log("[prio] SetResidencyPriority(%s) %llu MB %s -> %s", pr == D3D12_RESIDENCY_PRIORITY_LOW ? "LOW" : "HIGH", (unsigned long long)(bytes >> 20), KindName(kind), HrName(hr));
+                InterlockedIncrement64(pr == D3D12_RESIDENCY_PRIORITY_LOW ? &s_prioLow : &s_prioHigh);
+            }
+        }
+    }
+}
+static void AllocFreed(ResRec* r) {
+    if (r->twin) { ResRec* t = ResSlot(r->twin, false); r->twin = nullptr; if (!t) return; r = t; }
+    if (InterlockedExchange(&r->live, 0) != 1) return;
+    UINT64 b = r->bytes; int cat = r->cat; float life = NowSec() - r->t;
+    InterlockedAdd64(&s_liveB[cat], -(LONG64)b); InterlockedDecrement64(&s_liveN[cat]);
+    InterlockedAdd64(&s_iFreeB, (LONG64)b); InterlockedIncrement64(&s_iFreeN); InterlockedAdd64(&s_tFreeB, (LONG64)b);
+    InterlockedAdd64(&s_tLifeMs, (LONG64)(life * 1000)); InterlockedIncrement64(&s_tLifeN);
+    if (life < 2.0f) { InterlockedIncrement64(&s_shortN); InterlockedAdd64(&s_shortB, (LONG64)b); }
+    if (b >= (32ull << 20) && s_bigLogs <= 400) Log("[free ] -%llu MB %s heap=%s lived %.1f s | live total %lld MB", (unsigned long long)(b >> 20), KindName(cat % 3), HeapTypeName(cat / 3), life, (long long)(LiveTotal() >> 20));
+}
+static ULONG STDMETHODCALLTYPE H_ResRelease(void* self) {
+    ULONG n = o_ResRelease(self);
+    if (n == 0 && g_res) { if (ResRec* r = ResSlot(self, false)) if (r->live) AllocFreed(r); }
+    return n;
+}
 // ---- heap registry: heap pointer -> type/flags (so placed resources show their heap type)
-struct HeapRec { void* volatile key; int type; UINT flags; UINT64 size; };
+struct HeapRec { void* volatile key; int type; UINT flags; UINT64 size; volatile LONG live; float t; void* twin; };
 static HeapRec g_heaps[4096];
 static HeapRec* HeapSlot(void* p, bool insert) {
     if (!p) return nullptr;
@@ -1569,12 +1704,33 @@ static HeapRec* HeapSlot(void* p, bool insert) {
     }
     return nullptr;
 }
+static void HeapAccount(HeapRec* r, bool add) {
+    int t = (r->type >= 0 && r->type <= 5) ? r->type : 0; LONG64 b = (LONG64)r->size, sg = add ? 1 : -1;
+    InterlockedAdd64(&s_hLiveB[t], sg * b); InterlockedAdd64(&s_hLiveN[t], sg);
+    if (add) { InterlockedAdd64(&s_hAllocB, b); InterlockedAdd64(&s_hIAllocB, b); } else { InterlockedAdd64(&s_hFreeB, b); InterlockedAdd64(&s_hIFreeB, b); }
+    if (add && b >= (32ll << 20) && InterlockedIncrement(&s_bigLogs) <= 400) Log("[alloc] +%lld MB HEAP type=%s flags=0x%x", (long long)(b >> 20), HeapTypeName(t), r->flags);
+    if (!add && b >= (32ll << 20) && s_bigLogs <= 400) Log("[free ] -%lld MB HEAP type=%s lived %.1f s", (long long)(b >> 20), HeapTypeName(t), NowSec() - r->t);
+}
+static ULONG STDMETHODCALLTYPE H_HeapRelease(void* self) {
+    ULONG n = o_HeapRelease(self);
+    if (n == 0) {
+        HeapRec* r = HeapSlot(self, false);
+        if (r && r->twin) { HeapRec* t = HeapSlot(r->twin, false); r->twin = nullptr; r = t; }
+        if (r && InterlockedExchange(&r->live, 0) == 1) HeapAccount(r, false);
+    }
+    return n;
+}
 static void RecordHeap(void** pp, const D3D12_HEAP_DESC* d) {
     if (!pp || !*pp || !d) return;
     ID3D12Heap* h = nullptr;
     void* keys[2] = { *pp, nullptr };
     if (SUCCEEDED(((IUnknown*)*pp)->QueryInterface(IID_ID3D12Heap, (void**)&h)) && h) { keys[1] = h; h->Release(); }
-    for (void* k : keys) if (HeapRec* r = HeapSlot(k, true)) { r->type = d->Properties.Type; r->flags = d->Flags; r->size = d->SizeInBytes; }
+    for (int ki = 0; ki < 2; ki++) if (void* k = keys[ki]) if (HeapRec* r = HeapSlot(k, true)) {
+        r->type = d->Properties.Type; r->flags = d->Flags; r->size = d->SizeInBytes; r->t = NowSec();
+        r->twin = (ki && keys[0] != k) ? keys[0] : nullptr; r->live = 1;
+        if (ki == 0) HeapAccount(r, true);
+    }
+    if (!g_heapVtbl && keys[0]) { g_heapVtbl = *(void**)keys[0]; InstallRelease(g_heapVtbl, (void*)&H_HeapRelease, (void**)&o_HeapRelease); }
 }
 static void HookQueue(void* pq);
 static const D3D12_HEAP_PROPERTIES* PlacedHeapProps(ID3D12Heap* h, int* flagsOut) {
@@ -1616,6 +1772,7 @@ static void RecordRes(void* p, const char* fn, const D3D12_HEAP_PROPERTIES* hp, 
     r->width = d->Width; r->height = d->Height; r->depth = d->DepthOrArraySize; r->mips = d->MipLevels;
     r->fmt = d->Format; r->dim = d->Dimension; r->layout = d->Layout; r->flags = d->Flags;
     r->heapType = hp ? hp->Type : -1; r->heapFlags = hf;
+    r->bytes = 0; r->live = 0; r->twin = nullptr;
 }
 static void TrackRes(const char* fn, HRESULT hr, const D3D12_HEAP_PROPERTIES* hp, int hf, const D3D12_RESOURCE_DESC* d, void** pp) {
     if (FAILED(hr)) { LogResDesc(fn, hr, hp, hf, d); return; }
@@ -1625,6 +1782,7 @@ static void TrackRes(const char* fn, HRESULT hr, const D3D12_HEAP_PROPERTIES* hp
         if (InterlockedCompareExchangePointer((void* volatile*)&g_res, mem, nullptr) != nullptr && mem) VirtualFree(mem, 0, MEM_RELEASE);
     }
     RecordRes(*pp, fn, hp, hf, d);
+    if (g_cfg.allocStats) AllocAccount(*pp, fn, hp, d);
     if (d->Flags & D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT) {
         static volatile LONG n;
         if (InterlockedIncrement(&n) <= 40)
@@ -1632,8 +1790,8 @@ static void TrackRes(const char* fn, HRESULT hr, const D3D12_HEAP_PROPERTIES* hp
     }
     IUnknown* u = (IUnknown*)*pp; ID3D12Resource* r = nullptr;
     if (SUCCEEDED(u->QueryInterface(IID_ID3D12Resource, (void**)&r)) && r) {
-        if ((void*)r != *pp) RecordRes(r, fn, hp, hf, d);
-        if (!g_resVtbl) { g_resVtbl = *(void**)r; Log("Resource object vtable = %s", AddrName(g_resVtbl)); }
+        if ((void*)r != *pp) { RecordRes(r, fn, hp, hf, d); if (g_cfg.allocStats) { if (ResRec* a = ResSlot(r, false)) { a->twin = *pp; a->live = 1; } InterlockedIncrement64(&s_twinN); } }
+        if (!g_resVtbl) { g_resVtbl = *(void**)r; Log("Resource object vtable = %s", AddrName(g_resVtbl)); InstallRelease(g_resVtbl, (void*)&H_ResRelease, (void**)&o_ResRelease); }
         r->Release();
     }
 }
@@ -2152,8 +2310,10 @@ static HRESULT STDMETHODCALLTYPE H_CreateRootSignature(ID3D12Device* t, UINT nm,
     return hr;
 }
 static volatile LONG64 g_substBytes; static volatile LONG g_substN;
+static IDXGIAdapter3* g_ad3;
+static bool VramQuery(UINT64* use, UINT64* bud) { if (!g_ad3) return false; DXGI_QUERY_VIDEO_MEMORY_INFO a = {}; if (FAILED(g_ad3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &a))) return false; *use = a.CurrentUsage; *bud = a.Budget; return true; }
 static void VramLog(ID3D12Device* d, const char* why) {
-    static IDXGIAdapter3* ad; static volatile LONG busy;
+    IDXGIAdapter3*& ad = g_ad3; static volatile LONG busy;
     if (!d || InterlockedExchange(&busy, 1)) return;
     InternalScope is;
     if (!ad) {
@@ -2180,10 +2340,68 @@ static void VramLog(ID3D12Device* d, const char* why) {
             (unsigned long long)(ms.ullAvailPageFile >> 20), (unsigned long long)(ms.ullTotalPageFile >> 20), (unsigned long long)(ms.ullAvailVirtual >> 20)); }
     InterlockedExchange(&busy, 0);
 }
+static void AllocReport(const char* why, bool full, double secs) {
+    if (!g_cfg.allocStats || !g_res) return;
+    LONG64 aB = InterlockedExchange64(&s_iAllocB, 0), aN = InterlockedExchange64(&s_iAllocN, 0), fB = InterlockedExchange64(&s_iFreeB, 0), fN = InterlockedExchange64(&s_iFreeN, 0);
+    LONG64 haB = InterlockedExchange64(&s_hIAllocB, 0), hfB = InterlockedExchange64(&s_hIFreeB, 0);
+    Log("[mem] %s: interval %.1fs  resources +%lld MB (%lld) / -%lld MB (%lld)  heaps +%lld / -%lld MB | live total %lld MB (peak %lld MB) | lifetime: freed %lld, avg %.1f s, <2s: %lld (%lld MB)",
+        why, secs, (long long)(aB >> 20), (long long)aN, (long long)(fB >> 20), (long long)fN, (long long)(haB >> 20), (long long)(hfB >> 20),
+        (long long)(LiveTotal() >> 20), (long long)(s_peakLive >> 20), (long long)s_tLifeN, s_tLifeN ? double(s_tLifeMs) / 1000.0 / double(s_tLifeN) : 0.0, (long long)s_shortN, (long long)(s_shortB >> 20));
+    char line[512]; int o = 0;
+    for (int h = 1; h <= 4; h++) {
+        o = snprintf(line, sizeof line, "[mem]   %-8s", HeapTypeName(h));
+        for (int k = 0; k < 3; k++) o += snprintf(line + o, sizeof line - o, " | %s %lld MB (%lld)", KindName(k), (long long)(s_liveB[h * 3 + k] >> 20), (long long)s_liveN[h * 3 + k]);
+        if (s_liveN[h * 3] + s_liveN[h * 3 + 1] + s_liveN[h * 3 + 2] > 0) Log("%s", line);
+    }
+    Log("[mem]   residency hints: %lld LOW, %lld HIGH | big-buffer throttle: %lld waits, %lld ms total, %lld timeouts", (long long)s_prioLow, (long long)s_prioHigh, (long long)s_throttleN, (long long)s_throttleMs, (long long)s_throttleTimeouts);
+    Log("[mem]   explicit heaps live: DEFAULT %lld MB (%lld) UPLOAD %lld MB (%lld) READBACK %lld MB (%lld) CUSTOM %lld MB (%lld)  | placed resources %lld, tiled(unbacked) %lld, alias-twins %lld",
+        (long long)(s_hLiveB[1] >> 20), (long long)s_hLiveN[1], (long long)(s_hLiveB[2] >> 20), (long long)s_hLiveN[2], (long long)(s_hLiveB[3] >> 20), (long long)s_hLiveN[3], (long long)(s_hLiveB[4] >> 20), (long long)s_hLiveN[4],
+        (long long)s_placedN, (long long)s_reservedN, (long long)s_twinN);
+    if (!full) return;
+    // size histogram and top-N of live committed resources
+    static const UINT64 lim[6] = { 64ull << 10, 1ull << 20, 8ull << 20, 32ull << 20, 128ull << 20, ~0ull };
+    static const char* nm[6] = { "<64KB", "<1MB", "<8MB", "<32MB", "<128MB", ">=128MB" };
+    LONG64 hn[6] = {}, hb[6] = {}; ResRec* top[12] = {}; int nt = 0;
+    for (size_t i = 0; i < RES_SLOTS; i++) {
+        ResRec* r = &g_res[i];
+        if (!r->key || r->live != 1 || !r->bytes) continue;
+        int b = 0; while (r->bytes >= lim[b]) b++;
+        hn[b]++; hb[b] += (LONG64)r->bytes;
+        int pos = nt < 12 ? nt++ : 12; 
+        if (pos == 12) { if (r->bytes <= top[11]->bytes) continue; pos = 11; }
+        top[pos] = r;
+        for (int j = pos; j > 0 && top[j]->bytes > top[j - 1]->bytes; j--) { ResRec* t = top[j]; top[j] = top[j - 1]; top[j - 1] = t; }
+    }
+    o = snprintf(line, sizeof line, "[mem]   live size mix:");
+    for (int b = 0; b < 6; b++) o += snprintf(line + o, sizeof line - o, " %s=%lld (%lld MB)", nm[b], (long long)hn[b], (long long)(hb[b] >> 20));
+    Log("%s", line);
+    for (int i = 0; i < nt; i++) {
+        ResRec* r = top[i];
+        Log("[mem]   top%-2d %5llu MB  %s %s %llux%u mips=%u fmt=%s flags=0x%x heap=%s age=%.0fs via %s",
+            i + 1, (unsigned long long)(r->bytes >> 20), KindName(r->cat % 3), DimName(r->dim), (unsigned long long)r->width, r->height, r->mips, FormatName(r->fmt), r->flags,
+            HeapTypeName(r->cat / 3), NowSec() - r->t, r->fn);
+    }
+}
+// Big-buffer admission: the game creates replacement 512 MB pools while the old ones are still alive, which overshoots the VRAM budget.
+// Wait (bounded) for VRAM to have room before creating one, giving the game's own frees time to land.
+static void ThrottleBig(UINT64 width) {
+    UINT64 use, bud; DWORD t0 = GetTickCount(), waited = 0;
+    while (waited < (DWORD)g_cfg.bigBufWaitMs) {
+        if (!VramQuery(&use, &bud) || use + width <= bud / 100 * 97) break;
+        Sleep(50); waited = GetTickCount() - t0;
+    }
+    if (waited) {
+        InterlockedIncrement64(&s_throttleN); InterlockedAdd64(&s_throttleMs, waited);
+        bool to = waited >= (DWORD)g_cfg.bigBufWaitMs; if (to) InterlockedIncrement64(&s_throttleTimeouts);
+        static volatile LONG n; if (InterlockedIncrement(&n) <= 60) Log("[throttle] %llu MB buffer waited %lu ms for VRAM room (usage %llu / budget %llu MB)%s", (unsigned long long)(width >> 20), (unsigned long)waited, (unsigned long long)(use >> 20), (unsigned long long)(bud >> 20), to ? " -> timeout, creating anyway" : "");
+    }
+}
 static HRESULT STDMETHODCALLTYPE H_CreateCommittedResource(ID3D12Device* t, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES s, const D3D12_CLEAR_VALUE* cv, REFIID r, void** pp) {
+    if (g_cfg.bigBufWaitMs > 0 && hp && hp->Type == D3D12_HEAP_TYPE_DEFAULT && d && d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && d->Width >= (128ull << 20) && !IsInternal()) ThrottleBig(d->Width);
     HRESULT hr = o_CreateCommittedResource(t, hp, hf, d, s, cv, r, pp);
     if (hr == E_OUTOFMEMORY && hp && hp->Type == D3D12_HEAP_TYPE_DEFAULT && !IsInternal()) {
         VramLog(t, "CreateCommittedResource E_OUTOFMEMORY");
+        AllocReport("at E_OUTOFMEMORY", true, 0);
         for (int i = 0; i < g_cfg.oomRetries && hr == E_OUTOFMEMORY; i++) {      // give the game's streamer a moment to free memory
             Sleep(100);
             hr = o_CreateCommittedResource(t, hp, hf, d, s, cv, r, pp);
@@ -2778,6 +2996,62 @@ static void LogCodePolicy() {
             (unsigned)dc.ProhibitDynamicCode, (unsigned)dc.AllowThreadOptOut, (unsigned)dc.AllowRemoteDowngrade);
 }
 
+// Full-release build: RemapTable_Find(table=rcx, key=rdx). Patch: if the table is empty (size==0) return the key, like "disabled".
+//   80 79 04 00 74 72   cmp byte [rcx+4],0 ; je ret          -> e9 <stub> 90
+// stub (in the int3 padding after the function): cmp byte[rcx+4],0; je ret; cmp dword[rcx+18h],0; jne back; jmp ret
+static const uint8_t kRemap2Sig[] = { 0x80,0x79,0x04,0x00,0x74,0x72,0x48,0x89,0xC2,0x48,0xF7,0xD2,0x49,0x89,0xC0,0x49,0xC1,0xE0,0x15 };
+static bool ApplyRemap2(const char* when) {
+    int cnt = 0; uint8_t* a = FindInExe(kRemap2Sig, sizeof kRemap2Sig, &cnt);
+    if (!a || cnt != 1) return false;
+    if (a[0x78] != 0xC3) return false;
+    for (int i = 0; i < 15; i++) if (a[0x79 + i] != 0xCC) return false;
+    uint8_t* ret = a + 0x78; uint8_t* S = a + 0x79; uint8_t stub[15] = {};
+    stub[0]=0x80; stub[1]=0x79; stub[2]=0x04; stub[3]=0x00; stub[4]=0x74; stub[5]=(uint8_t)(int8_t)(ret - (S + 6));
+    stub[6]=0x83; stub[7]=0x79; stub[8]=0x18; stub[9]=0x00; stub[10]=0x75; stub[11]=(uint8_t)(int8_t)((a + 6) - (S + 12));
+    stub[12]=0xEB; stub[13]=(uint8_t)(int8_t)(ret - (S + 14)); stub[14]=0xCC;
+    uint8_t hook[6] = { 0xE9, 0,0,0,0, 0x90 }; *(int32_t*)(hook + 1) = (int32_t)(S - (a + 5));
+    if (!WriteCode(S, stub, sizeof stub) || !WriteCode(a, hook, sizeof hook)) { Log("[patch] RemapFallback(v2): game code write failed (error %lu) -> exception-handler fix only (%s)", g_writeCodeErr, when); return true; }
+    Log("[patch] RemapFallback(v2) APPLIED in code at %s (%s): empty remap table now returns the resource itself", AddrName(a), when);
+    return true;
+}
+// Every inlined copy of the game's remap-table lookup begins with "cmp byte [reg+4],0 ; je skip" (table disabled -> keep the key) and then the
+// hash (not, shl 21, ...). An empty-but-enabled table has a NULL bucket array and crashes. Change the test to "cmp dword [reg+18h],0 ; je skip"
+// (table size == 0 -> keep the key). Same length, same ModRM, so it is a 2-byte change per site. Sites are found by pattern, not by address.
+static int ScanRemapSites(const char* when) {
+    HMODULE exe = GetModuleHandleW(nullptr); IMAGE_NT_HEADERS64* nt = NtHeaders(exe);
+    if (!nt) return 0;
+    int patched = 0, seen = 0;
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (int si = 0; si < nt->FileHeader.NumberOfSections; si++) {
+        if (!(sec[si].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* p = (uint8_t*)exe + sec[si].VirtualAddress; size_t sz = sec[si].Misc.VirtualSize;
+        for (size_t off = 0; off < sz;) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(p + off, &mbi, sizeof mbi)) break;
+            size_t run = (uint8_t*)mbi.BaseAddress + mbi.RegionSize - (p + off);
+            if (run > sz - off) run = sz - off;
+            bool ok = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+            if (ok && run > 128) {
+                uint8_t* q = p + off; uint8_t* end = q + run - 100;
+                for (; q < end; q++) {
+                    if (q[0] != 0x80 || (q[1] & 0xF8) != 0x78 || q[1] == 0x7C || q[2] != 0x04 || q[3] != 0x00) continue;
+                    int jl = (q[4] == 0x74) ? 2 : (q[4] == 0x0F && q[5] == 0x84) ? 6 : 0;
+                    if (!jl) continue;
+                    uint8_t* a = q + 4 + jl; bool notf = false, shl = false;
+                    for (int k = 0; k < 14; k++) if ((a[k] == 0x48 || a[k] == 0x49) && a[k + 1] == 0xF7 && (a[k + 2] & 0xF8) == 0xD0) notf = true;
+                    for (int k = 0; k < 48; k++) if ((a[k] == 0x48 || a[k] == 0x49 || a[k] == 0x4C || a[k] == 0x4D) && a[k + 1] == 0xC1 && (a[k + 2] & 0xF8) == 0xE0 && a[k + 3] == 0x15) shl = true;
+                    if (!notf || !shl) continue;
+                    seen++;
+                    uint8_t nb[4] = { 0x83, q[1], 0x18, 0x00 };
+                    if (WriteCode(q, nb, 4)) { patched++; if (patched <= 40) Log("[patch] RemapFallback(v3) site #%d at %s: enabled-test -> size-test", patched, AddrName(q)); }
+                }
+            }
+            off += run;
+        }
+    }
+    Log("[patch] RemapFallback(v3): %d lookup site(s) found, %d patched (%s)", seen, patched, when);
+    return patched;
+}
 static volatile LONG g_patchesDone;
 static void ApplyGamePatches(const char* when) {
     if (!g_cfg.patchRemapFallback || g_patchesDone) return;
@@ -2785,7 +3059,11 @@ static void ApplyGamePatches(const char* when) {
     uint8_t* at = FindInExe(kRemapSig, sizeof kRemapSig, &cnt);
     uint8_t* atP = FindInExe(kRemapPatched, sizeof kRemapPatched, &cntP);
     if (atP && !at) { Log("[patch] RemapFallback already applied at %s", AddrName(atP)); InterlockedExchange(&g_patchesDone, 1); return; }
-    if (!at) { Log("[patch] RemapFallback: signature not found (%s) - game version differs or code still packed", when); return; }
+    if (!at) {
+        bool a2 = ApplyRemap2(when); int n3 = ScanRemapSites(when);
+        if (a2 || n3) { InterlockedExchange(&g_patchesDone, 1); return; }
+        Log("[patch] RemapFallback: signature not found (%s) - game version differs or code still packed (exception-handler fix for the full-release layout stays armed)", when); return;
+    }
     if (cnt != 1) { Log("[patch] RemapFallback: signature found %d times - not patching (ambiguous)", cnt); InterlockedExchange(&g_patchesDone, 1); return; }
     InterlockedExchange(&g_patchesDone, 1);
     bool ok = g_cfg.patchRemapFallback != 2 && WriteCode(at, kRemapPatched, sizeof kRemapPatched);
@@ -3128,6 +3406,7 @@ static DWORD WINAPI Heartbeat(void*) {
         if (g_remapFixups) Log("[alive] RemapFallback fixes so far: %ld", g_remapFixups);
         PragRelocProbe("heartbeat");
         VramLog(g_lastDevice, "heartbeat");
+        { static DWORD lastFull; DWORD nowT = GetTickCount(); bool full = nowT - lastFull > 30000; if (full) lastFull = nowT; AllocReport("heartbeat", full, interval); }
         Log("[alive] queue submits: direct=%ld compute=%ld copy=%ld  signals=%ld waits=%ld tileMappingUpdates=%ld RemoveDevice=%ld",
             c_exec[0], c_exec[2], c_exec[3], c_signal, c_wait, c_tile, c_removeDevice);
         Log("[alive] devices=%ld featureChecks=%ld gPSO=%ld cPSO=%ld streamPSO=%ld rootSigs=%ld resources=%ld heaps=%ld descHeaps=%ld FAILED=%ld  workingSet=%llu MB private=%llu MB",
